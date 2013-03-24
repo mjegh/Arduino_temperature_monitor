@@ -1,0 +1,218 @@
+A week ago one of our air conditioning systems blew up and took the others out with it. Temperatures quickly rose and before long <a href="http://www.nagios.org/">nagios</a> spotted a machine had gone down. Nothing really bad had happened at this point but when we could not get the air conditioning back online we had to temporarily turn off some non essential systems to keep the heat down. Could we have spotted this earlier?
+
+We don't directly monitor the temperature in this machine room with nagios. We looked around and found you can buy £300+ units which fit in your rack to do this but they all seem to use proprietary software and don't link up with nagios without a lot of tinkering. <a href="http://www.martin-evans.me.uk/node/86">Having used arduinos to monitor my electricty at home</a> I knew it would be a simple job to buy an arduino and a temperature sensor and monitor it with a nagios and a bit of Perl. My colleague sourced a couple of <a href="http://arduino.cc/en/Main/ArduinoBoardUno">Arduino Unos</a> and some TMP36 sensors.
+
+The TMP36 is a TO-92 package, measures -40°C to 150°C at 10mV per &deg;C and outputs 0.1V to 2.0V over that range. You can drive it from a 2.7V to 5.5V supply and the Arduino Uno has 5V and 3.3V supplies but greater accuracy is achieved with the 3.3V supply when attached to the Arduino 10bit ADC.
+
+Armed with a soldering iron and a short length of 0.6mm single core wire (fits the Arduino sockets perfectly) within 5 minutes we had the electronics sorted out. All we did is plug the TMP36 ground to Arduino ground, the output (centre pin of the TMP36) to Arduino analog input A0 and the TMP36 supply to the Arduino 3.3V (which is also connected to the Arduino AREF). Note the later Arduino script sets the AREF to external.
+
+Picking a Linux machine in the rack we connected it up to the Uno via USB. Because we might add additional TMP36 sensors to the Uno (which has 6 ADCs) we elected to send over the serial interface a number and a carriage return where the number would be the ADC we wanted to read (although the example here ignores the number and always returns the data from A0). With this setup nagios can call a simple Perl script which uses Device::SerialPort to talk to the Arduino, send the ADC we want to read and then return the temperature. The simple script for the Arduino was:
+
+<c>
+// $Id$
+// script for arduino to read voltage on A0 from a TMP36
+int sensorPin = A0;    // select the input pin for the potentiometer
+int ledPin = 13;      // select the pin for the LED
+int sensorValue = 0;  // variable to store the value coming from the sensor
+float temp; //temperature
+float millivolts; // voltage conversion from ADC
+// we are using 3.3V and the 10bit ADC gives us 1024 values
+float conversion_factor = 3300.00 / 1024.00;
+char read_buffer[100]; // whatever was sent from Perl
+
+void setup() {
+  // declare the ledPin as an OUTPUT:
+  pinMode(ledPin, OUTPUT);
+  Serial.begin(115200);
+  analogReference(EXTERNAL);
+}
+
+void loop() {
+  // wait to read something on the serial port
+  if (Serial.available() > 0) {
+      // turn the ledPin on
+      digitalWrite(ledPin, HIGH);
+
+      // just read whatever it is - we don't really care what it is right now
+     // but we would if we had multiple TMP36 sensors
+      Serial.readBytes(read_buffer, sizeof(read_buffer));
+
+      // read the value from the sensor:
+      sensorValue = analogRead(sensorPin);
+
+     millivolts = sensorValue * conversion_factor;
+     // we subtract 500 (100 for the .1V the TMP36 starts at and 400 for the -40 degrees C at 10mV per degree C and divide by 10 as the TMP36 does 10mV per degree C
+     temp = (millivolts - 500) / 10;
+     Serial.println(temp);
+     // stop the program for <sensorValue> milliseconds:
+     delay(500);
+     // turn the ledPin off:
+     digitalWrite(ledPin, LOW);
+  }
+}
+</c>
+
+I had Perl code using Win32::SerialPort I stole but I needed something for Linux. Device::SerialPort seemed to be the answer for Linux but I had a few problems making it work as well. The Perl script was:
+
+<perl>
+#!/usr/bin/env perl
+# $Id$
+#
+# Script to obtain the temperature read from the arduino device attached to the named
+# device below. Intended to be run by nagios and hence it takes the optional arguments
+# -w N and -c N where -w is warning level and -c is critical level. Script does this:
+#
+# if -c specified and temp is above it, it will output a critical temperature message and exit with 2
+# else if -w specified and temp is above it, it will output a warning temperature message and exit
+#   with 1
+# else it outputs the temperature
+#
+# if -d dir specified it overrides the above and writes the file YYYY_MM_DD.log to the dir
+# specified with -d with localtime(), temp
+#
+# -v verbose
+# -s device - defaults to /dev/ttyACM0 (you can omit the /dev/
+#
+use strict;
+use warnings;
+use Getopt::Std;
+use File::Spec;
+
+my $device = '/dev/ttyACM0';    # device arduino attached to
+
+my %opts;
+
+getopts('vw:c:d:s:', \%opts);
+
+if ($opts{s})  {
+    if ($opts{s} !~ /\//) {
+        $device = "/dev/$opts{s}";
+    } else {
+        $device = $opts{s};
+    }
+}
+
+use Device::SerialPort qw( :STAT 0.19);
+
+my $port = Device::SerialPort->new($device);
+
+if( ! defined($port) ) {
+        die("Can't open $device: $^E\n");
+}
+
+my $output = select(STDOUT);
+$|++;
+
+#$port->initialize(); Win32::SerialPort had this but Device::SerialPort does not
+
+# the following are necessary and the baud rate must be set in the arduino script too:
+$port->baudrate(115200);
+$port->parity('none');
+$port->databits(8);
+$port->stopbits(1);
+
+# not sure how many of these are not the defaults:
+$port->stty_ignbrk(1);
+$port->stty_icrnl(0);
+$port->stty_opost(0);
+$port->stty_inlcr(0);
+$port->stty_isig(1);
+$port->stty_icanon(0);
+$port->stty_echo(0);
+$port->stty_echoe(0);
+$port->stty_echok(0);
+$port->stty_echoctl(0);
+$port->stty_echoke(0);
+
+$port->write_settings() or die "write settings";
+$port->are_match("\n");
+
+$port->write("t\n");            # send msg to arduino asking for temperature
+
+# there is something funny which happens if we start writing to the serial
+# port too quickly - sometimes you don't get a response. A sleep 2 here fixes
+# that but it also slows down the script. A better way is that if we get nothing back
+# from the arduino we send another request for the temperature - see the write below:
+#
+my $temp;
+while (1) {
+    my $char = $port->lookfor();
+    if ($char eq '') {
+        #print "no input found\n";
+        # got nothing, sometimes happens, ask again
+        $port->write("t\n");
+    } elsif (!defined($char)) {
+        die "error";
+    } else {
+        $char =~ s/\xd//g;
+        # very occassionally we get duff stuff back
+        # check the returned temp looks right and if not have another go
+        if ($char =~ /^\d{1,2}\.\d\d$/) {
+            $temp = $char;
+            last;
+        } else {
+            if ($opts{v}) {
+                print "Got: ", join(",", map {ord($_)} split //,$char), "\n";
+            }
+            $port->write("t\n"); # have another go
+        }
+    }
+};
+
+$port->close();
+
+if ($opts{d}) {
+    my @lt = localtime();
+    my $filename = sprintf('%4d_%02d_%02d.log', $lt[5] + 1900, $lt[4]+1, $lt[3]);
+    my $path = File::Spec->catfile($opts{d}, $filename);
+    open (my $fh, ">>", $path) or die "Failed to open $path for append - $!";
+    print $fh time(), ",$temp\n";
+    close $fh;
+    print time(), ",$temp\n" if $opts{v};
+} elsif ($opts{c} && $temp > $opts{c}) {
+    print "Critical temperature $temp\n";
+    exit 2;
+} elsif ($opts{w} && $temp > $opts{w}) {
+    print "Warning temperature $temp\n";
+    exit 1;
+} else {
+    print "Temperature $temp\n";
+}
+exit 0;
+</perl>
+
+A few points need explanation. Run without arguments the Perl above simple outputs the temperature. Normally, from nagios, it is run with a -w temp1 -c temp2 where temp1 and temp2 define the warning and critical temperatures. The apparently daft code which checks the temperature read from the Arduino looks like NN.NN is because occassionally it seems to read a temperature which contains NN.NN but also has additional characters before or after it (I don't know why, it works fine in Windows). Also when running this on Linux instead of Windows if you send a string to the Arduino too quickly it never seems to respond so there is some code which resends the command if nothing is retrieved (I'd be interested in any comments as none of this is necessary on Windows). Finally, this code is also run from cron with -d path where it writes the ctime and temperature into a CSV file at path in a file YYYY_MM_DD.log and in the future we may graph this.
+
+Lastly there is the nagios configuration which for us is slightly complicated by the fact we don't fiddle with the system Perl and use perlbrew instead. It is:
+
+<code>
+define command {
+         command_name check_temp
+         command_line
+/home/perlbrew/perl5/perlbrew/perls/perl-5.14.2/bin/perl
+/home/easysoft/scripts/temperature/temperature.pl -w $ARG1$ -c $ARG2$ -s $ARG3$
+}
+
+define service {
+        use 				generic-service
+        host_name 			xxxx
+        service_description 		Machine Room Temperature 0
+        check_command 			check_temperature!22!28!/dev/ttyACM0
+        }
+</code>
+
+Next steps are to use dancer and google charts API to graph the temperature over time from the csv created via the cron job.
+
+<b>UPDATE:</b> We haven't got as far as using Dancer and google charts to graph the temperature because nagios can graph the termperature. So long as you install rrdtool and pnp for nagios a 1 line change to the above script will allow nagios to graph the temperature. Instead of:
+
+<perl>
+print "Temperature $temp\n";
+</perl>
+
+just use
+
+<perl>
+print "Temperature $temp\|temp=$temp\n";
+</perl>
+
+and that is all there is to it. Now in the service details just click on the red star ("Perform extra service actions") and you'll get a graph over time.

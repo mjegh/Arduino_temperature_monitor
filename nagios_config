@@ -1,0 +1,14 @@
+# Slightly complicated for us as we use perlbrew and don't touch the system Perl
+define command {
+         command_name check_temp
+         command_line
+/home/perlbrew/perl5/perlbrew/perls/perl-5.14.2/bin/perl
+/home/easysoft/scripts/temperature/temperature.pl -w $ARG1$ -c $ARG2$ -s $ARG3$
+}
+
+define service {
+        use                             generic-service
+        host_name                       xxxx
+        service_description             Machine Room Temperature 0
+        check_command                   check_temperature!22!28!/dev/ttyACM0
+        }
